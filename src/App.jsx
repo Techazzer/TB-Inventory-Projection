@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const LEAD_TIME  = 15;
@@ -68,13 +68,28 @@ function downloadCSV(data, type = "projections", reverseMap = {}) {
 // ─── Ghost SKU CSV Download ───────────────────────────────────────────────────
 function downloadGhostCSV(ghostSkus) {
   const date = new Date().toISOString().slice(0, 10);
-  const headers = ["Master SKU", "Units Sold (Last 30d)", "Action Required", "Notes"];
+
+  // Collect all unique channels across all ghosts (for dynamic columns)
+  const allChannels = [...new Set(
+    ghostSkus.flatMap(g => Object.keys(g.channels30d || {}))
+  )].sort();
+
+  const headers = [
+    "Raw SKU (from Transactions)",
+    "Total Units (Last 30d)",
+    "Status in Status CSV",
+    ...allChannels.map(c => `${c} (30d)`),
+    "Action Required",
+  ];
+
   const rows = ghostSkus.map(g => [
     g.sku,
     g.units30d,
-    "Add to Inventory CSV + SKU Status CSV",
-    "SKU has live sales but is missing from Inventory CSV — invisible to projection engine",
+    g.status || "—",
+    ...allChannels.map(c => g.channels30d?.[c] || 0),
+    "\"Add to Inventory CSV + SKU Status CSV + Mapped SKUs (if combo/bundle)\"",
   ]);
+
   const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
@@ -178,13 +193,13 @@ function processData(invRows, txnRows, statusText, mappedText) {
   const masterData = {};
   // First, process the uploaded Inventory CSV (primary source of truth for stock)
   for (const inv of invRows) {
-    const sku = (inv["Master SKU"] || "").trim();
+    const sku = (inv["Master SKU"] || inv["Channel SKU"] || inv["Product SKU"] || inv["SKU"] || "").trim();
     if (!sku) continue;
     const info = statusLookup[sku] || {};
     masterData[sku] = {
       sku,
       name: (inv["Product Name"] || info.name || sku).trim(),
-      stock: parseFloat(inv["Available Inventory - Good"]) || 0,
+      stock: parseFloat(inv["Available Inventory - Good"] || inv["Current Stock"] || inv["Available Inventory"] || inv["Quantity"]) || 0,
       status_tag: info.status || "Active"
     };
   }
@@ -236,17 +251,34 @@ function processData(invRows, txnRows, statusText, mappedText) {
   const startOngoingMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
   const s10 = {}, s30 = {}, sM1 = {}, sM2 = {};
+  // rawUnits30d / rawChannels30d: track units & channel breakdown per ORIGINAL
+  // (pre-mapping) rawSku in last 30d — used for correct ghost detection and CSV export.
+  const rawUnits30d = {};
+  const rawChannels30d = {};
 
   // 4. Aggregate Transactions with Mapping
   for (const row of txnRows) {
     if ((row["Is Reverse"] || "").toLowerCase() === "yes") continue;
-    if ((row["Status"] || "").toUpperCase() === "CANCELED") continue;
+    if ((row["Status"] || row["Order Status"] || row["status"] || "").toUpperCase() === "CANCELED") continue;
 
-    let rawSku = (row["Master SKU"] || "").trim();
-    const qty = parseFloat(row["Product Quantity"]) || 1;
-    const dt = new Date(row["Shiprocket Created At"] || "");
-    const channel = (row["Channel"] || "Unknown").toUpperCase();
+    let rawSku = (row["Master SKU"] || row["Product SKU"] || row["Channel SKU"] || row["SKU"] || "").trim();
+    const qty = parseFloat(row["Product Quantity"] || row["Quantity"]) || 1;
+    let dtStr = row["Shiprocket Created At"] || row["Order Date"] || row["Date"] || row["created_at"] || "";
+    // If Shiprocket sends DD-MM-YYYY format, converting to valid format for new Date()
+    if (dtStr.includes("-") && dtStr.split("-")[0].length === 2) {
+      const parts = dtStr.split(" ")[0].split("-");
+      if (parts.length === 3) dtStr = `${parts[2]}-${parts[1]}-${parts[0]} ${dtStr.split(" ")[1] || ""}`;
+    }
+    const dt = new Date(dtStr);
+    const channel = (row["Channel"] || row["Channel Name"] || "Unknown").toUpperCase();
     if (!rawSku || isNaN(dt)) continue;
+
+    // Track raw units + channel breakdown before mapping (for ghost detection + CSV)
+    if (dt >= d30) {
+      rawUnits30d[rawSku] = (rawUnits30d[rawSku] || 0) + qty;
+      rawChannels30d[rawSku] = rawChannels30d[rawSku] || {};
+      rawChannels30d[rawSku][channel] = (rawChannels30d[rawSku][channel] || 0) + qty;
+    }
 
     // Apply mapping to bundle/child SKUs (can be multiple masters)
     const masters = mappingDict[rawSku] || [rawSku];
@@ -347,13 +379,29 @@ function processData(invRows, txnRows, statusText, mappedText) {
   results.sort((a, b) => a.days_out - b.days_out);
   deadStock.sort((a, b) => b.stock - a.stock);
 
-  // Detect "ghost" SKUs: have recent sales in transactions but are NOT in Inventory CSV at all.
-  // These are newly launched/unlisted books that are being sold but not tracked.
+  // ── Ghost SKU Detection ───────────────────────────────────────────────────
+  // RULE: A raw transaction SKU is a GHOST only if it has NO mapping AND
+  // is NOT directly in the inventory CSV.
+  //
+  // KEY INSIGHT: If a combo (e.g. TBC_SB_BANK_EN) IS in mappingDict →
+  // its sales are already attributed to its masters via the forEach loop.
+  // Whether those masters are in inventory or not is a MASTER-level concern,
+  // not a combo-level ghost. So mapped combos are NEVER ghosts.
   const ghostSkus = [];
-  for (const sku of Object.keys(s30)) {
-    if (!masterData[sku] && s30[sku] > 0) {
-      ghostSkus.push({ sku, units30d: s30[sku] });
-    }
+  for (const rawSku of Object.keys(rawUnits30d)) {
+    const isMapped     = !!(mappingDict[rawSku] && mappingDict[rawSku].length > 0);
+    const isInInventory = !!masterData[rawSku];
+
+    // Skip if already tracked in any way
+    if (isMapped || isInInventory) continue;
+
+    // True ghost: completely unknown — no mapping, not in inventory
+    ghostSkus.push({
+      sku: rawSku,
+      units30d: rawUnits30d[rawSku],
+      channels30d: rawChannels30d[rawSku] || {},
+      status: statusLookup[rawSku]?.status || "—",
+    });
   }
   ghostSkus.sort((a, b) => b.units30d - a.units30d);
 
@@ -380,22 +428,26 @@ function StockBar({ stock, proj60 }) {
 function DropZone({ label, hint, onFile, loaded, fileName }) {
   const [drag, setDrag] = useState(false);
   const read = f => { if (!f) return; const r = new FileReader(); r.onload = e => onFile(e.target.result, f.name); r.readAsText(f); };
+  
   return (
     <div
       onDragOver={e => { e.preventDefault(); setDrag(true); }}
       onDragLeave={() => setDrag(false)}
       onDrop={e => { e.preventDefault(); setDrag(false); read(e.dataTransfer.files[0]); }}
-      className={`relative rounded-2xl border-2 border-dashed p-6 text-center cursor-pointer transition-all
-        ${drag ? "border-indigo-400 bg-indigo-900/20" : loaded ? "border-emerald-600 bg-emerald-950/20" : "border-gray-700 bg-gray-900/30 hover:border-gray-500"}`}
+      className={`relative p-6 border-2 border-dashed rounded-xl transition-all ${drag ? "border-indigo-500 bg-indigo-900/20" : loaded ? "border-emerald-500 bg-emerald-900/10" : "border-gray-700 bg-gray-800"}`}
     >
-      <input type="file" accept=".csv" className="absolute inset-0 opacity-0 cursor-pointer w-full h-full" onChange={e => read(e.target.files[0])} />
-      <div className="text-3xl mb-2">{loaded ? "✅" : "📂"}</div>
-      <p className="text-sm font-semibold text-white">{label}</p>
-      {loaded ? <p className="text-xs text-emerald-400 mt-1 truncate">{fileName}</p>
-        : <p className="text-xs text-gray-500 mt-1">{hint}</p>}
+      <input type="file" accept=".csv" onChange={e => read(e.target.files[0])} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+      <div className="text-center pointer-events-none">
+        {loaded ? <div className="text-green-400 font-bold mb-2 text-2xl">✅</div> : <div className="text-gray-500 text-2xl mb-2">📄</div>}
+        <h3 className="font-bold text-gray-200">{label}</h3>
+        <p className="text-xs mt-1 text-gray-400">{hint}</p>
+        {loaded && fileName && <p className="text-xs mt-2 text-emerald-400 break-all">{fileName}</p>}
+      </div>
     </div>
   );
 }
+
+
 
 function FormulaPanel() {
   return (
@@ -595,11 +647,15 @@ function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName })
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
+
   const [invText, setInvText] = useState(null);
   const [txnText, setTxnText] = useState(null);
+  const [showUpload, setShowUpload] = useState(false);
   const [invName, setInvName] = useState("");
   const [txnName, setTxnName] = useState("");
   const [data, setData] = useState(null);
+  const [apiData, setApiData] = useState(null);
   const [runError, setRunError] = useState("");
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -621,7 +677,15 @@ export default function App() {
   const [authPwd, setAuthPwd] = useState("");
   const [isAuth, setIsAuth] = useState(false);
 
-  // Load Seeded CSVs on Mount
+  // API + Sync States
+  const [sysStatus, setSysStatus] = useState({ 
+    isSyncing: false, lastSynced: null, syncSchedule: "", emailSchedule: "", emailTo: "", emailCc: "" 
+  });
+  const [apiError, setApiError] = useState("");
+
+  // Load Seeded CSVs and API Status on Mount — auto-run projection with cached data
+  const autoRunRef = useRef(false);
+
   useEffect(() => {
     const loadConfig = async () => {
       let statusCSV = localStorage.getItem("sku_status_csv");
@@ -635,15 +699,111 @@ export default function App() {
         try { const res = await fetch("/mapped_skus.csv"); mappedCSV = await res.text(); } catch (e) { console.error(e); }
       }
       if (mappedCSV) setMappedSkusText(mappedCSV);
+
+      // Fetch backend status and initial data
+      fetchStatus();
+      fetchApiData();
+
+      // Auto-load cached data and run projection
+      try {
+        autoRunRef.current = true;
+      } catch(e) {}
     };
     loadConfig();
+
+    // Poll sync status every 5 seconds
+    const interval = setInterval(fetchStatus, 5000);
+    return () => clearInterval(interval);
   }, []);
 
-  // ── Run projection ──────────────────────────────────────────────────────────
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/status`, { cache: "no-store" });
+      if (res.ok) setSysStatus(await res.json());
+    } catch(e) {}
+  };
+
+  const fetchApiData = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/data?t=${Date.now()}`, { cache: "no-store" });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.invCSV && d.txnCSV) {
+          setApiData({ invCSV: d.invCSV, txnCSV: d.txnCSV });
+          setInvText(d.invCSV); setInvName("API: Shiprocket Inventory");
+          setTxnText(d.txnCSV); setTxnName("API: Shiprocket Transactions (Cache)");
+        }
+      }
+    } catch(e) {}
+  };
+
+  const handleApiSync = async () => {
+    try {
+      setApiError("");
+      const res = await fetch(`${API_BASE}/api/sync`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json();
+        setApiError(err.message || "Failed to start sync");
+      } else {
+        setSysStatus(prev => ({ ...prev, isSyncing: true }));
+        // Poll until sync finishes, then load data and auto-run
+        const pollSync = setInterval(async () => {
+          try {
+            const st = await fetch(`${API_BASE}/api/status`);
+            if (st.ok) {
+              const sd = await st.json();
+              setSysStatus(sd);
+              if (!sd.isSyncing) {
+                clearInterval(pollSync);
+                // Load fresh data
+                await fetchApiData();
+                autoRunRef.current = true;
+              }
+            }
+          } catch(e) {}
+        }, 3000);
+      }
+    } catch(e) {
+      setApiError("Backend is not running.");
+    }
+  };
+
+  const saveBackendSettings = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/settings`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          adminPwd: authPwd,
+          syncSchedule: sysStatus.syncSchedule,
+          emailSchedule: sysStatus.emailSchedule,
+          emailTo: sysStatus.emailTo,
+          emailCc: sysStatus.emailCc
+        })
+      });
+      if (!res.ok) alert("Failed to save backend settings.");
+      else alert("Backend Settings Saved!");
+    } catch(e) { alert("Backend not reachable"); }
+  };
+
+  const triggerManualEmail = async () => {
+    if (!data) return alert("Run projection first to calculate urgent SKUs.");
+    const urgentData = data.filter(r => r.status === "urgent");
+    if (!urgentData.length) return alert("No urgent SKUs right now!");
+    try {
+      const res = await fetch(`${API_BASE}/api/email_urgent`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urgentList: urgentData })
+      });
+      const d = await res.json();
+      if (res.ok) alert("Email Sent!");
+      else alert("Error: " + d.error);
+    } catch(e) { alert("Backend Error"); }
+  };
+
   const handleRun = useCallback(() => {
     setRunError(""); setData(null);
     try {
-      if (!invText || !txnText) { setRunError("Upload both CSVs first."); return; }
+      if (!invText || !txnText) { setRunError("Upload both CSVs or Sync first."); return; }
       const inv = parseCSV(invText);
       const txn = parseCSV(txnText);
       const { results, deadStock, mappingDict, lastMonthName: lm, prevMonthName: pm, ghostSkus: gs } = processData(inv, txn, skuStatusText, mappedSkusText);
@@ -658,6 +818,14 @@ export default function App() {
       setViewMode("projections");
     } catch (e) { setRunError("Processing error: " + e.message); }
   }, [invText, txnText, skuStatusText, mappedSkusText]);
+
+  // Auto-run projection when cached data is loaded
+  useEffect(() => {
+    if (autoRunRef.current && invText && txnText) {
+      autoRunRef.current = false;
+      handleRun();
+    }
+  }, [invText, txnText, handleRun]);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
   const counts = useMemo(() => data ? {
@@ -728,39 +896,37 @@ export default function App() {
         <div>
           <p className="text-indigo-500 text-xs tracking-widest uppercase mb-1">Reprint Planning System</p>
           <h1 className="text-3xl font-bold">📦 Inventory Projection</h1>
-          <p className="text-gray-500 text-xs mt-1">Adaptive Weighted Rate · {LEAD_TIME}d print lead time · {PROJ_DAYS}d planning window</p>
+          <div className="flex items-center gap-3 mt-1">
+            <p className="text-gray-500 text-xs">Adaptive Weighted Rate · {LEAD_TIME}d print lead time · {PROJ_DAYS}d planning window</p>
+            {sysStatus.lastSynced && (
+              <span className="text-emerald-600 text-xs font-mono">✓ Synced {(() => {
+                const diff = Date.now() - new Date(sysStatus.lastSynced).getTime();
+                const mins = Math.floor(diff / 60000);
+                if (mins < 1) return 'just now';
+                if (mins < 60) return `${mins}m ago`;
+                const hrs = Math.floor(mins / 60);
+                if (hrs < 24) return `${hrs}h ago`;
+                return `${Math.floor(hrs / 24)}d ago`;
+              })()}</span>
+            )}
+          </div>
         </div>
-        <button onClick={() => setShowSettings(true)} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold transition-all text-gray-300">
-          ⚙️ Settings
-        </button>
+        <div className="flex gap-2 items-center">
+          {apiError && <span className="text-red-400 text-xs">{apiError}</span>}
+          <button 
+            onClick={handleApiSync} 
+            disabled={sysStatus.isSyncing}
+            className={`px-4 py-2 rounded-xl text-sm font-bold shadow transition-all ${sysStatus.isSyncing ? "bg-indigo-900/50 text-indigo-400 cursor-not-allowed border border-indigo-900 animate-pulse" : "bg-indigo-600 hover:bg-indigo-500 text-white"}`}
+          >
+            {sysStatus.isSyncing ? "⏳ Syncing..." : "🔄 Sync"}
+          </button>
+          <button onClick={() => setShowSettings(true)} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold transition-all text-gray-300 border border-gray-700">
+            ⚙️ Settings
+          </button>
+        </div>
       </div>
 
-      {/* Upload */}
-      <div className="rounded-2xl border border-gray-800 bg-gray-900/40 p-6 mb-6">
-        <p className="text-gray-300 text-sm font-semibold mb-4">📁 Upload Data Files</p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-          <DropZone
-            label="Current Inventory CSV"
-            hint="Needs: Master SKU · Available Inventory - Good · Product Name"
-            onFile={(t, n) => { setInvText(t); setInvName(n); setData(null); }}
-            loaded={!!invText} fileName={invName}
-          />
-          <DropZone
-            label="Total Transactions CSV"
-            hint="Needs: Master SKU · Shiprocket Created At · Product Quantity · Status · Is Reverse"
-            onFile={(t, n) => { setTxnText(t); setTxnName(n); setData(null); }}
-            loaded={!!txnText} fileName={txnName}
-          />
-        </div>
-        {runError && <p className="text-red-400 text-xs mb-3 bg-red-950 border border-red-800 rounded-lg px-3 py-2">⚠ {runError}</p>}
-        <button onClick={handleRun} disabled={!invText || !txnText}
-          className={`w-full py-3 rounded-xl font-bold text-sm transition-all
-            ${invText && txnText ? "bg-indigo-600 hover:bg-indigo-500 text-white" : "bg-gray-800 text-gray-600 cursor-not-allowed"}`}>
-          {data ? "🔄 Re-run Projection" : "▶ Run Projection"}
-        </button>
-      </div>
-
-      {/* Tabs / Sub-Views */}
+      {/* Settings Panel */}
       {data && (
         <div className="flex gap-2 border-b border-gray-800 pb-4 mb-6">
           <button onClick={() => setViewMode("projections")} className={`px-4 py-2 font-bold text-sm rounded-lg transition-all ${viewMode === "projections" ? "bg-indigo-900 text-indigo-200" : "text-gray-500 hover:bg-gray-900 hover:text-gray-300"}`}>
@@ -859,7 +1025,7 @@ export default function App() {
                 <div className="flex-1">
                   <div className="flex items-center justify-between gap-3 mb-1 flex-wrap">
                     <p className="text-orange-300 font-bold text-sm">
-                      {ghostSkus.length} Ghost SKU{ghostSkus.length > 1 ? "s" : ""} Detected — Selling but NOT in Inventory CSV!
+                      👻 {ghostSkus.length} Ghost SKU{ghostSkus.length > 1 ? "s" : ""} — Selling but NOT in Inventory or Mapping sheet
                     </p>
                     <button
                       onClick={() => downloadGhostCSV(ghostSkus)}
@@ -869,15 +1035,30 @@ export default function App() {
                     </button>
                   </div>
                   <p className="text-orange-400/70 text-xs mb-3">
-                    These SKUs have transactions in the last 30 days but are missing from your Inventory CSV.
-                    They are <strong>invisible to the projection engine</strong>. Add them to your Inventory CSV and Mapped SKUs sheet.
+                    These SKUs appear in raw transactions (last 30d) but have <strong>no mapping to any master</strong> and are <strong>not in Inventory CSV</strong>.
+                    Hover any chip to see channel breakdown. Download CSV for full detail.
                   </p>
                   <div className="flex flex-wrap gap-2">
-                    {ghostSkus.map(g => (
-                      <span key={g.sku} className="px-2.5 py-1 rounded-lg bg-orange-900 border border-orange-700 font-mono text-xs text-orange-200">
-                        {g.sku} <span className="text-orange-400 ml-1">({g.units30d} units/30d)</span>
-                      </span>
-                    ))}
+                    {ghostSkus.map(g => {
+                      const chBreakdown = Object.entries(g.channels30d || {})
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([ch, u]) => `${ch}: ${u}`)
+                        .join(" | ");
+                      const title = `Channels: ${chBreakdown || "—"}\nStatus: ${g.status}`;
+                      return (
+                        <span
+                          key={g.sku}
+                          title={title}
+                          className="px-2.5 py-1 rounded-lg font-mono text-xs border bg-orange-900 border-orange-700 text-orange-200 cursor-help"
+                        >
+                          {g.sku}
+                          <span className="opacity-70 ml-1">({g.units30d}u)</span>
+                          {g.status && g.status !== "—" && (
+                            <span className="ml-1.5 text-gray-400 text-[10px]">[{g.status}]</span>
+                          )}
+                        </span>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -962,38 +1143,75 @@ export default function App() {
       )}
 
       {/* Mapped SKUs View */}
-      {viewMode === "mapped" && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-lg font-bold">SKU Mappings Dictionary</h2>
-            <button onClick={() => downloadCSV(mapDict, "mapped")} className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm font-bold text-gray-300">
-              ⬇ Download CSV
-            </button>
+      {viewMode === "mapped" && (() => {
+        // Build the reverse map directly from the raw mappedSkusText CSV
+        // so this view always works regardless of whether processData ran with it.
+        const rm = {};
+        if (mappedSkusText) {
+          const mapRows = parseCSV(mappedSkusText);
+          for (const r of mapRows) {
+            const master = (r.master_sku || "").trim();
+            const mapped  = (r.mapped_skus || "").trim();
+            if (!master || !mapped) continue;
+            if (!rm[master]) rm[master] = [];
+            mapped.split(",").map(s => s.trim()).filter(Boolean).forEach(child => {
+              if (!rm[master].includes(child)) rm[master].push(child);
+            });
+          }
+        } else if (Object.keys(reverseMap).length > 0) {
+          // Fallback: use the reverseMap from processData
+          Object.assign(rm, reverseMap);
+        }
+        const entries = Object.entries(rm).sort((a, b) => a[0].localeCompare(b[0]));
+        return (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden p-4">
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold">SKU Mappings Dictionary</h2>
+                <p className="text-gray-500 text-xs mt-0.5">{entries.length} master SKUs · {Object.values(rm).reduce((a, v) => a + v.length, 0)} total child mappings</p>
+              </div>
+              <button onClick={() => downloadCSV(mapDict, "mapped")} className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm font-bold text-gray-300">
+                ⬇ Download CSV
+              </button>
+            </div>
+            {entries.length === 0 ? (
+              <p className="text-gray-500 text-sm py-8 text-center">
+                No mapping data found. Make sure <code className="text-orange-400">mapped_skus.csv</code> is in the Settings or that the public file is loaded.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm border-collapse">
+                  <thead>
+                    <tr className="border-b border-gray-700 text-gray-400">
+                      <th className="py-2 px-3 font-medium w-48">Master SKU</th>
+                      <th className="py-2 px-3 font-medium">Mapped From (Combo/Child SKUs)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {entries.map(([master, children]) => (
+                      <tr key={master} className="border-b border-gray-800/50 hover:bg-gray-800/20">
+                        <td className="py-3 px-3 align-top">
+                          <span className="text-emerald-400 font-bold bg-emerald-950 px-2 py-1 rounded border border-emerald-900 font-mono text-xs">{master}</span>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="flex flex-wrap gap-2">
+                            {children.map(child => (
+                              <span key={child} className={`font-mono text-xs px-2 py-0.5 rounded break-all
+                                ${child === master ? "text-emerald-400 bg-emerald-950/50 border border-emerald-900" : "text-gray-400 bg-gray-800"}`}>
+                                {child}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm border-collapse">
-              <thead>
-                <tr className="border-b border-gray-700 text-gray-400">
-                  <th className="py-2 px-3 font-medium">Master SKU (Active)</th>
-                  <th className="py-2 px-3 font-medium">Mapped From (Combo/Child SKUs)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(reverseMap).map(([master, children]) => (
-                  <tr key={master} className="border-b border-gray-800/50 hover:bg-gray-800/20">
-                    <td className="py-3 px-3"><span className="text-emerald-400 font-bold bg-emerald-950 px-2 py-1 rounded border border-emerald-900">{master}</span></td>
-                    <td className="py-3 px-3">
-                      <div className="flex flex-wrap gap-2">
-                        {children.map(child => <span key={child} className="text-gray-400 font-mono text-xs bg-gray-800 px-2 py-0.5 rounded break-all">{child}</span>)}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Settings Modal */}
       {showSettings && (
@@ -1017,8 +1235,45 @@ export default function App() {
                   </button>
                 </div>
               ) : (
-                <div className="space-y-6">
-                  <p className="text-sm border-b border-indigo-900 pb-2 text-indigo-300">Update the seeded CSV lists. Changes save directly to your browser.</p>
+                <div className="space-y-6 max-h-[70vh] overflow-y-auto pr-2">
+                  <div className="border-b border-indigo-900/50 pb-4">
+                    <h3 className="text-indigo-300 font-bold mb-3 flex items-center justify-between">
+                      🔄 Auto-Sync & Email Alerts
+                      <button onClick={saveBackendSettings} className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow">
+                        Save Backend Settings
+                      </button>
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Shiprocket Sync Schedule (Cron)</label>
+                        <input type="text" value={sysStatus.syncSchedule || ""} onChange={e => setSysStatus({...sysStatus, syncSchedule: e.target.value})}
+                          className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none" placeholder="0 * * * * (Hourly)" />
+                        <p className="text-[10px] text-gray-500 mt-1">Default runs every hour automatically.</p>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Urgent Email Schedule (Cron)</label>
+                        <input type="text" value={sysStatus.emailSchedule || ""} onChange={e => setSysStatus({...sysStatus, emailSchedule: e.target.value})}
+                          className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none" placeholder="0 10 * * * (10 AM Daily)" />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Alert Email 'To' (comma separated)</label>
+                        <input type="text" value={sysStatus.emailTo || ""} onChange={e => setSysStatus({...sysStatus, emailTo: e.target.value})}
+                          className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none" placeholder="team@example.com" />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Alert Email 'CC' (comma separated)</label>
+                        <input type="text" value={sysStatus.emailCc || ""} onChange={e => setSysStatus({...sysStatus, emailCc: e.target.value})}
+                          className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none" placeholder="manager@example.com" />
+                      </div>
+                    </div>
+                    <div className="mt-4 flex gap-3">
+                      <button onClick={triggerManualEmail} className="px-3 py-1.5 bg-orange-900/40 border border-orange-800 text-orange-400 hover:bg-orange-900 rounded-lg text-xs font-bold transition-all">
+                        ✉️ Send Urgent Email Now
+                      </button>
+                    </div>
+                  </div>
+
+                  <p className="text-sm font-bold text-gray-300">Seed Configuration Data</p>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <DropZone label="SKU Status CSV" hint="Upload latest active list"

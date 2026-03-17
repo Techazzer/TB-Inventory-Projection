@@ -4,3 +4,8 @@ dist
 *.local
 .env
 .env.*
+
+# Backend files
+backend_cache.json
+backend_config.json
+sync_debug*.log
