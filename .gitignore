@@ -5,6 +5,18 @@ dist
 .env
 .env.*
 
+# Backend generated files
+backend_cache.json
+backend_config.json
+sync_debug*.log
+
+# Google Service Account key — NEVER commit this
+*.json
+!package.json
+!package-lock.json
+!vercel.json
+!backend_config.json.example
+
 # Backend files
 backend_cache.json
 backend_config.json

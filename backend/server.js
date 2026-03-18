@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const cron = require("node-cron");
 const axios = require("axios");
+const { google } = require("googleapis");
 const { sendUrgentEmail } = require("./mailer");
 
 const app = express();
@@ -14,14 +15,14 @@ app.use(express.json());
 const CONFIG_PATH = path.join(__dirname, "../backend_config.json");
 const CACHE_PATH = path.join(__dirname, "../backend_cache.json");
 
-// Define a default configuration
 const defaultCfg = {
   adminPassword: "Testbook_new",
-  syncSchedule: "0 * * * *", // every hour
-  emailSchedule: "0 10 * * *", // 10 AM daily
+  syncSchedule: "0 * * * *",
+  emailSchedule: "0 10 * * *",
   emailTo: "",
   emailCc: "",
   lastSynced: null,
+  lastPrintSynced: null,
   isSyncing: false
 };
 
@@ -30,9 +31,7 @@ function getConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       return { ...defaultCfg, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
     }
-  } catch (e) {
-    console.error("Error reading config", e);
-  }
+  } catch (e) { console.error("Error reading config", e); }
   return { ...defaultCfg };
 }
 
@@ -44,24 +43,153 @@ function getCache() {
   try {
     if (fs.existsSync(CACHE_PATH)) return JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
   } catch (e) {}
-  return { invCSV: "", txnCSV: "" };
+  return { invCSV: "", txnCSV: "", printData: {}, printDataStaleSince: null };
 }
 
-// Global sync state to prevent overlapping syncs
 let isSyncing = false;
 
+// ── Google Sheets API (Print Mastersheet) ───────────────────────────────────
+async function fetchPrintMastersheet() {
+  const sheetId = process.env.GOOGLE_SHEET_PRINT_ID;
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const keyRaw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+
+  if (!sheetId || !email || !keyRaw) {
+    throw new Error("Print Mastersheet env vars not configured");
+  }
+
+  const privateKey = keyRaw.replace(/\\n/g, "\n");
+
+  const auth = new google.auth.JWT({
+    email,
+    key: privateKey,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
+
+  const sheets = google.sheets({ version: "v4", auth });
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: "A:Q", // Cols A-Q as per spec
+  });
+
+  const rows = response.data.values || [];
+  if (rows.length < 2) return {};
+
+  // Skip header row. Build printData map:
+  // For each SKU, filter Col E = "In Print" AND Col I = "GGN"
+  // Then pick most recent by Col N (Sent to Printing Date)
+  // Cols: A=SKU, E=Status, I=Warehouse, M=QtyOrdered, N=SentDate, O=PrinterETA, P=PrintingDoneDate, Q=GRNDate
+  // Index:  0     4         8             12              13            14                15               16
+
+  const allRows = rows.slice(1); // skip header
+
+  const bySkuActive = {}; // sku -> best row
+
+  for (const row of allRows) {
+    const sku = (row[0] || "").trim();
+    const status = (row[4] || "").trim();
+    const warehouse = (row[8] || "").trim();
+
+    if (!sku || status !== "In Print" || warehouse !== "GGN") continue;
+
+    const sentDateStr = (row[13] || "").trim();
+    const sentDate = sentDateStr ? new Date(sentDateStr) : null;
+
+    if (!bySkuActive[sku]) {
+      bySkuActive[sku] = row;
+    } else {
+      // Pick most recent Sent to Printing date
+      const existingSentStr = (bySkuActive[sku][13] || "").trim();
+      const existingSent = existingSentStr ? new Date(existingSentStr) : null;
+      if (sentDate && (!existingSent || sentDate > existingSent)) {
+        bySkuActive[sku] = row;
+      }
+    }
+  }
+
+  // Build normalized printData map
+  const printData = {};
+  for (const [sku, row] of Object.entries(bySkuActive)) {
+    printData[sku] = {
+      qty: parseInt((row[12] || "0").replace(/,/g, ""), 10) || 0,
+      sentDate: (row[13] || "").trim() || null,
+      printerETA: (row[14] || "").trim() || null,
+      printingDoneDate: (row[15] || "").trim() || null,
+      grnDate: (row[16] || "").trim() || null,
+    };
+  }
+
+  return printData;
+}
+
+// ── CSV Parser ───────────────────────────────────────────────────────────────
+function parseCSVLine(line) {
+  const result = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (inQuotes) {
+      if (char === '"' && next === '"') { field += '"'; i++; }
+      else if (char === '"') { inQuotes = false; }
+      else { field += char; }
+    } else {
+      if (char === '"') { inQuotes = true; }
+      else if (char === ',') { result.push(field.trim()); field = ""; }
+      else { field += char; }
+    }
+  }
+  result.push(field.trim());
+  return result;
+}
+
+function parseGoogleSheetCSV(text) {
+  if (!text) return [];
+  const lines = [];
+  let currentLine = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (char === '"' && next === '"') { field += '"'; i++; }
+      else if (char === '"') { inQuotes = false; }
+      else { field += char; }
+    } else {
+      if (char === '"') { inQuotes = true; }
+      else if (char === ',') { currentLine.push(field.trim()); field = ""; }
+      else if (!inQuotes && (char === '\n' || (char === '\r' && next === '\n'))) {
+        currentLine.push(field.trim()); lines.push(currentLine); currentLine = []; field = "";
+        if (char === '\r') i++;
+      } else if (!inQuotes && char === '\r') {
+        currentLine.push(field.trim()); lines.push(currentLine); currentLine = []; field = "";
+      } else { field += char; }
+    }
+  }
+  if (field || currentLine.length > 0) { currentLine.push(field.trim()); lines.push(currentLine); }
+  return lines;
+}
+
+// ── performSync ───────────────────────────────────────────────────────────────
 async function performSync() {
   if (isSyncing) return;
   isSyncing = true;
-  
+
+  const cache = getCache();
+
   try {
-    console.log("Starting Google Sheets Sync...");
-    
+    console.log("Starting full sync...");
+
     const invUrl = process.env.GOOGLE_SHEET_INVENTORY_CSV_URL;
     const txnUrl = process.env.GOOGLE_SHEET_TRANSACTIONS_CSV_URL;
-
     if (!invUrl || !txnUrl) throw new Error("Google Sheets CSV URLs missing in .env");
 
+    let txnSyncOk = true;
+    let printSyncOk = true;
+
+    // ── Fetch Inventory + Transactions CSVs ──────────────────────────────────
     const [invRes, txnRes] = await Promise.all([
       axios.get(invUrl),
       axios.get(txnUrl)
@@ -70,13 +198,10 @@ async function performSync() {
     const invCSV = invRes.data.trim();
     const txnCSVRaw = txnRes.data.trim();
 
-    // Flexible Transaction Parsing
     const txnRows = parseGoogleSheetCSV(txnCSVRaw);
     if (txnRows.length < 2) throw new Error("Transaction sheet is empty");
 
     const headers = txnRows[0].map(h => h.trim().toLowerCase());
-    
-    // Find indices with fallbacks
     const findIdx = (names) => {
       for (const name of names) {
         const idx = headers.indexOf(name.toLowerCase());
@@ -92,47 +217,54 @@ async function performSync() {
     const statusIdx = findIdx(["Status", "Order Status", "State"]);
     const isReverseIdx = findIdx(["Is Reverse", "Reverse"]);
 
-    console.log("Mapping indices:", { skuIdx, qtyIdx, dateIdx, channelIdx, statusIdx });
-
     if (skuIdx === -1 || dateIdx === -1) {
       throw new Error(`Required headers not found. Got: ${headers.slice(0, 8).join(", ")}`);
     }
 
     let normalizedTxns = ["Master SKU,Product Quantity,Shiprocket Created At,Channel,Status,Is Reverse"];
-    
     for (let i = 1; i < txnRows.length; i++) {
-        const row = txnRows[i];
-        if (row.length < Math.max(skuIdx, dateIdx)) continue;
+      const row = txnRows[i];
+      if (row.length < Math.max(skuIdx, dateIdx)) continue;
+      const sku = (row[skuIdx] || "").trim();
+      if (!sku || sku.toLowerCase() === "master sku") continue;
+      const qty = (row[qtyIdx] || "1").trim();
+      const dateRaw = (row[dateIdx] || "").trim();
+      const channel = (channelIdx !== -1 ? row[channelIdx] : "Unknown").trim();
+      const status = (statusIdx !== -1 ? row[statusIdx] : "NEW").trim();
+      const isReverse = (isReverseIdx !== -1 ? row[isReverseIdx] : "No").trim();
+      const quote = (s) => `"${(s || "").replace(/"/g, '""')}"`;
+      normalizedTxns.push(`${quote(sku)},${qty},${quote(dateRaw)},${quote(channel)},${quote(status)},${quote(isReverse)}`);
+    }
+    const txnCSV = normalizedTxns.join("\n");
 
-        const sku = (row[skuIdx] || "").trim();
-        if (!sku || sku.toLowerCase() === "master sku") continue;
+    // ── Fetch Print Mastersheet ───────────────────────────────────────────────
+    let printData = cache.printData || {};
+    let printDataStaleSince = null;
 
-        const qty = (row[qtyIdx] || "1").trim();
-        const dateRaw = (row[dateIdx] || "").trim();
-        
-        // Handle potential Time column shift
-        // If the next column after date is NOT the channel but looks like a time (e.g. AM/PM or HH:MM)
-        // we might need to merge it or skip it. 
-        // For now, if channelIdx is found correctly, we just use it.
-        const channel = (channelIdx !== -1 ? row[channelIdx] : "Unknown").trim();
-        const status = (statusIdx !== -1 ? row[statusIdx] : "NEW").trim();
-        const isReverse = (isReverseIdx !== -1 ? row[isReverseIdx] : "No").trim();
-
-        // One-liner CSV row construction (simple escape)
-        const quote = (s) => `"${(s || "").replace(/"/g, '""')}"`;
-        normalizedTxns.push(`${quote(sku)},${qty},${quote(dateRaw)},${quote(channel)},${quote(status)},${quote(isReverse)}`);
+    try {
+      printData = await fetchPrintMastersheet();
+      console.log(`Print Mastersheet synced: ${Object.keys(printData).length} active SKUs`);
+    } catch (printErr) {
+      console.error("Print Mastersheet sync failed:", printErr.message);
+      printSyncOk = false;
+      printDataStaleSince = cache.printDataStaleSince || new Date().toISOString();
     }
 
-    const txnCSV = normalizedTxns.join("\n");
-    
-    // Save to local cache
-    fs.writeFileSync(CACHE_PATH, JSON.stringify({ invCSV, txnCSV }));
-    
+    // ── Save to cache ─────────────────────────────────────────────────────────
+    const newCache = {
+      invCSV,
+      txnCSV,
+      printData,
+      printDataStaleSince: printSyncOk ? null : printDataStaleSince,
+    };
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(newCache));
+
     const cfg = getConfig();
     cfg.lastSynced = new Date().toISOString();
+    if (printSyncOk) cfg.lastPrintSynced = new Date().toISOString();
     saveConfig(cfg);
-    
-    console.log(`Sync complete: ${normalizedTxns.length - 1} rows processed.`);
+
+    console.log(`Sync complete: ${normalizedTxns.length - 1} txn rows · printOk=${printSyncOk}`);
   } catch (err) {
     console.error("Sync failed:", err.message);
   } finally {
@@ -140,115 +272,30 @@ async function performSync() {
   }
 }
 
-// Helper function to parse CSV line respecting quotes
-function parseCSVLine(line) {
-  const result = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    const next = line[i + 1];
-
-    if (inQuotes) {
-      if (char === '"' && next === '"') {
-        field += '"';
-        i++;
-      } else if (char === '"') {
-        inQuotes = false;
-      } else {
-        field += char;
-      }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ',') {
-        result.push(field.trim());
-        field = "";
-      } else {
-        field += char;
-      }
-    }
-  }
-  result.push(field.trim());
-  return result;
-}
-
-// More robust CSV parser that handles Google Sheets format
-function parseGoogleSheetCSV(text) {
-  if (!text) return [];
-  const lines = [];
-  let currentLine = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    const next = text[i + 1];
-
-    if (inQuotes) {
-      if (char === '"' && next === '"') {
-        field += '"';
-        i++;
-      } else if (char === '"') {
-        inQuotes = false;
-      } else {
-        field += char;
-      }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ',') {
-        currentLine.push(field.trim());
-        field = "";
-      } else if (!inQuotes && (char === '\n' || (char === '\r' && next === '\n'))) {
-        currentLine.push(field.trim());
-        lines.push(currentLine);
-        currentLine = [];
-        field = "";
-        if (char === '\r') i++;
-      } else if (!inQuotes && char === '\r') {
-        currentLine.push(field.trim());
-        lines.push(currentLine);
-        currentLine = [];
-        field = "";
-      } else {
-        field += char;
-      }
-    }
-  }
-
-  if (field || currentLine.length > 0) {
-    currentLine.push(field.trim());
-    lines.push(currentLine);
-  }
-
-  return lines;
-}
-
-// --- API ROUTES ---
-
+// ── API Routes ────────────────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
   res.set("Cache-Control", "no-store");
   const cfg = getConfig();
+  const cache = getCache();
   res.json({
     lastSynced: cfg.lastSynced,
-    isSyncing: isSyncing,
+    lastPrintSynced: cfg.lastPrintSynced,
+    isSyncing,
     syncSchedule: cfg.syncSchedule,
     emailSchedule: cfg.emailSchedule,
     emailTo: cfg.emailTo,
-    emailCc: cfg.emailCc
+    emailCc: cfg.emailCc,
+    printDataStale: !!cache.printDataStaleSince,
+    printDataStaleSince: cache.printDataStaleSince || null,
   });
 });
 
-app.post("/api/upload_csv", express.json({limit: '50mb'}), (req, res) => {
+app.post("/api/upload_csv", express.json({ limit: "50mb" }), (req, res) => {
   const { type, text } = req.body;
-  if (!text || (type !== 'inv' && type !== 'txn')) return res.status(400).json({error: "Invalid payload"});
-  
+  if (!text || (type !== "inv" && type !== "txn")) return res.status(400).json({ error: "Invalid payload" });
   const cache = getCache();
-  if (type === 'inv') cache.invCSV = text;
-  if (type === 'txn') cache.txnCSV = text;
-  
+  if (type === "inv") cache.invCSV = text;
+  if (type === "txn") cache.txnCSV = text;
   fs.writeFileSync(CACHE_PATH, JSON.stringify(cache));
   res.json({ success: true, message: "File synced to backend cache successfully" });
 });
@@ -256,28 +303,19 @@ app.post("/api/upload_csv", express.json({limit: '50mb'}), (req, res) => {
 app.post("/api/settings", (req, res) => {
   const { adminPwd } = req.body;
   const cfg = getConfig();
-  
   if (cfg.adminPassword !== adminPwd && adminPwd !== "Testbook") {
     return res.status(401).json({ error: "Invalid admin password" });
   }
-
-  // Update fields if provided
   ["adminPassword", "syncSchedule", "emailSchedule", "emailTo", "emailCc"].forEach(k => {
     if (req.body[k] !== undefined) cfg[k] = req.body[k];
   });
-  
   saveConfig(cfg);
-  
-  // Reload CRON jobs
   setupCronJobs();
-  
   res.json({ success: true, message: "Settings saved" });
 });
 
 app.post("/api/sync", async (req, res) => {
   if (isSyncing) return res.status(429).json({ message: "Sync already in progress" });
-  
-  // Run async without blocking response
   performSync();
   res.json({ message: "Sync started in background" });
 });
@@ -288,7 +326,12 @@ app.get("/api/data", (req, res) => {
   res.set("Expires", "0");
   if (isSyncing) return res.status(503).json({ error: "Syncing in progress" });
   const cache = getCache();
-  res.json(cache); // { invCSV, txnCSV }
+  res.json({
+    invCSV: cache.invCSV || "",
+    txnCSV: cache.txnCSV || "",
+    printData: cache.printData || {},
+    printDataStaleSince: cache.printDataStaleSince || null,
+  });
 });
 
 app.post("/api/email_urgent", async (req, res) => {
@@ -296,7 +339,6 @@ app.post("/api/email_urgent", async (req, res) => {
     const { urgentList } = req.body;
     const cfg = getConfig();
     if (!cfg.emailTo) return res.status(400).json({ error: "No email address configured in settings" });
-    
     await sendUrgentEmail(cfg.emailTo, cfg.emailCc, urgentList);
     res.json({ success: true, message: "Email sent successfully" });
   } catch (e) {
@@ -304,14 +346,12 @@ app.post("/api/email_urgent", async (req, res) => {
   }
 });
 
-// --- CRON JOBS ---
+// ── Cron Jobs ─────────────────────────────────────────────────────────────────
 let syncTask, emailTask;
-
 function setupCronJobs() {
   const cfg = getConfig();
   if (syncTask) syncTask.stop();
   if (emailTask) emailTask.stop();
-  
   if (cfg.syncSchedule) {
     syncTask = cron.schedule(cfg.syncSchedule, () => {
       console.log("CRON: Running Scheduled Sync");
@@ -322,7 +362,6 @@ function setupCronJobs() {
 
 setupCronJobs();
 
-// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend API running on http://localhost:${PORT}`);

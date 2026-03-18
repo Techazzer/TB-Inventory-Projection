@@ -562,11 +562,121 @@ function FormulaPanel() {
   );
 }
 
-function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName }) {
+// ─── Print Helpers ────────────────────────────────────────────────────────────
+function getPrintStatus(sku, printData, daysToStockout) {
+  const pd = printData?.[sku];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (!pd) {
+    const urgentNoOrder = daysToStockout != null && daysToStockout <= 15;
+    return { state: urgentNoOrder ? "reprint_needed" : "none", qty: 0,
+      printerETA: null, warehouseETA: null, grnDate: null,
+      printerDelayDays: 0, warehouseDelayDays: 0, hasDelays: false, noETA: false };
+  }
+
+  const parseDate = (s) => {
+    if (!s) return null;
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  };
+
+  const grnDate = parseDate(pd.grnDate);
+  const printerETA = parseDate(pd.printerETA);
+  const warehouseETA = parseDate(pd.printingDoneDate); // Col P = printing done / warehouse ETA
+  const sentDate = parseDate(pd.sentDate);
+
+  const daysDiff = (d) => {
+    if (!d) return 0;
+    const t = new Date(d); t.setHours(0,0,0,0);
+    return Math.floor((today - t) / 86400000);
+  };
+
+  const printerDelayDays = printerETA ? Math.max(0, daysDiff(printerETA)) : 0;
+  const warehouseDelayDays = warehouseETA ? Math.max(0, daysDiff(warehouseETA)) : 0;
+  const hasDelays = (printerDelayDays > 0 || warehouseDelayDays > 0) && !grnDate;
+  const noETA = pd.qty > 0 && !printerETA && !warehouseETA;
+  const state = grnDate ? "received" : "in_print";
+
+  return { state, qty: pd.qty, printerETA, warehouseETA, grnDate,
+    printerDelayDays, warehouseDelayDays, hasDelays, noETA };
+}
+
+function fmtDate(d) {
+  if (!d) return null;
+  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+}
+
+function PrintStatusRow({ sku, printData, daysToStockout }) {
+  const ps = getPrintStatus(sku, printData, daysToStockout);
+
+  if (ps.state === "received") {
+    return (
+      <div className="mt-2 pt-2 border-t border-gray-700/50">
+        <span className="text-emerald-400 text-xs font-mono">✓ Received — stock arriving soon</span>
+      </div>
+    );
+  }
+
+  if (ps.state === "reprint_needed") {
+    return (
+      <div className="mt-2 pt-2 border-t border-gray-700/50">
+        <span className="text-amber-400 text-xs font-mono">⚡ Reprint needed — no active print order</span>
+      </div>
+    );
+  }
+
+  if (ps.state === "none") {
+    return (
+      <div className="mt-2 pt-2 border-t border-gray-700/50">
+        <span className="text-gray-600 text-xs font-mono">🖨 In Print: — · Not tracked</span>
+      </div>
+    );
+  }
+
+  // in_print state
+  const parts = [`🖨 In Print: ${ps.qty.toLocaleString()} qty`];
+
+  const makeETAPart = (label, date, delayDays) => {
+    if (!date) return null;
+    const dateStr = fmtDate(date);
+    const delay = delayDays > 0 ? (
+      <span className="text-red-400 ml-1">⚠ Delayed {delayDays}d</span>
+    ) : null;
+    return <span>{label}: {dateStr}{delay}</span>;
+  };
+
+  if (ps.noETA) {
+    return (
+      <div className="mt-2 pt-2 border-t border-gray-700/50">
+        <span className="text-gray-500 text-xs font-mono">
+          🖨 In Print: {ps.qty.toLocaleString()} qty · <span className="text-red-400">No ETA added</span>
+        </span>
+      </div>
+    );
+  }
+
+  const printerPart = makeETAPart("Printer", ps.printerETA, ps.printerDelayDays);
+  const warehousePart = makeETAPart("Warehouse", ps.warehouseETA, ps.warehouseDelayDays);
+
+  return (
+    <div className="mt-2 pt-2 border-t border-gray-700/50">
+      <span className="text-gray-500 text-xs font-mono flex flex-wrap gap-1 items-center">
+        <span>🖨 In Print: {ps.qty.toLocaleString()} qty</span>
+        {printerPart && <><span className="text-gray-600">·</span>{printerPart}</>}
+        {warehousePart && <><span className="text-gray-600">·</span>{warehousePart}</>}
+      </span>
+    </div>
+  );
+}
+
+function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName, printData }) {
   const cfg = statusCfg[item.status];
   const delta = item.proj60 - item.old_proj60;
+  const ps = getPrintStatus(item.sku, printData, item.days_out);
+  const delayAccent = ps.hasDelays && item.status !== "urgent" ? " border-l-4 border-l-red-600" : "";
   return (
-    <div className={`rounded-xl border ${cfg.border} ${cfg.bg} p-4 hover:scale-[1.01] transition-transform`}>
+    <div className={`rounded-xl border ${cfg.border} ${cfg.bg}${delayAccent} p-4 hover:scale-[1.01] transition-transform`}>
       <div className="flex items-start justify-between gap-2 mb-3">
         <div className="flex-1 min-w-0">
           <p className="text-white font-semibold text-sm leading-snug" title={item.name}>{item.name}</p>
@@ -641,7 +751,199 @@ function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName })
 
         </div>
       )}
+
+      {/* Print Status Row — always visible at bottom of card */}
+      <PrintStatusRow sku={item.sku} printData={printData} daysToStockout={item.days_out} />
     </div>
+  );
+}
+
+// ─── Print Timeline Tab ───────────────────────────────────────────────────────
+const PRINT_SHEET_URL = `https://docs.google.com/spreadsheets/d/${import.meta.env.VITE_PRINT_SHEET_ID || "1jukH-tiSaUFicNcNCrpSOChL9OfPLkze0FYMTq7J4QE"}`;
+
+function PrintTimelineTab({ data, printData }) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const next7 = new Date(today); next7.setDate(today.getDate() + 7);
+
+  const activeOrders = Object.entries(printData || {}).filter(([, pd]) => !pd.grnDate);
+  const totalInPrint = activeOrders.reduce((sum, [, pd]) => sum + (pd.qty || 0), 0);
+  const activeSKUCount = activeOrders.length;
+
+  const parseDate = (s) => { if (!s) return null; const d = new Date(s); return isNaN(d.getTime()) ? null : d; };
+
+  const delayedCount = activeOrders.filter(([, pd]) => {
+    const pETA = parseDate(pd.printerETA);
+    return pETA && pETA < today;
+  }).length;
+
+  const arrivingThisWeekCount = activeOrders.filter(([, pd]) => {
+    const pETA = parseDate(pd.printerETA);
+    return pETA && pETA >= today && pETA <= next7;
+  }).length;
+
+  // Urgency score table
+  const urgencyRows = (data || []).map(item => {
+    const score = item.stock === 0 ? Infinity : Math.pow(item.eff_rate, 2) / item.stock;
+    const ps = getPrintStatus(item.sku, printData, item.days_out);
+    const pData = printData?.[item.sku];
+    const printerETA = pData ? parseDate(pData.printerETA) : null;
+    const warehouseETA = pData ? parseDate(pData.printingDoneDate) : null;
+    const grnDate = pData ? parseDate(pData.grnDate) : null;
+
+    let badgeLabel = "Not Tracked"; let badgeCls = "text-gray-500 bg-gray-800";
+    if (ps.state === "reprint_needed") { badgeLabel = "⚡ Reprint Needed"; badgeCls = "text-amber-300 bg-amber-900"; }
+    else if (ps.state === "received" || grnDate) { badgeLabel = "Received ✓"; badgeCls = "text-emerald-300 bg-emerald-900"; }
+    else if (ps.state === "in_print") {
+      if (ps.noETA) { badgeLabel = "In Print · No ETA"; badgeCls = "text-amber-300 bg-amber-900"; }
+      else if (ps.printerDelayDays > 0 && ps.warehouseDelayDays > 0) { badgeLabel = "Both Delayed"; badgeCls = "text-red-300 bg-red-900"; }
+      else if (ps.printerDelayDays > 0) { badgeLabel = `Printer Delayed · ${ps.printerDelayDays}d`; badgeCls = "text-red-300 bg-red-900"; }
+      else if (printerETA) {
+        const daysLeft = Math.ceil((printerETA - today) / 86400000);
+        badgeLabel = `In Print · ${daysLeft}d`; badgeCls = "text-blue-300 bg-blue-900";
+      }
+    }
+
+    const rowHighlight = ps.hasDelays ? " bg-red-950/20" : "";
+
+    return { ...item, score, ps, pData, printerETA, warehouseETA, grnDate, badgeLabel, badgeCls, rowHighlight };
+  }).sort((a, b) => {
+    if (b.score === Infinity && a.score === Infinity) return a.sku.localeCompare(b.sku);
+    if (b.score === Infinity) return 1;
+    if (a.score === Infinity) return -1;
+    return b.score - a.score;
+  });
+
+  const urgencyLabel = (days) => {
+    if (days <= 7)  return { label: "Critical", cls: "text-red-300 bg-red-900" };
+    if (days <= 15) return { label: "High",     cls: "text-orange-300 bg-orange-900" };
+    if (days <= 30) return { label: "Medium",   cls: "text-yellow-300 bg-yellow-900" };
+    if (days <= 74) return { label: "Low",      cls: "text-emerald-400 bg-emerald-900/50" };
+    return { label: "Safe", cls: "text-green-300 bg-green-900" };
+  };
+
+  const statCards = [
+    { label: "📦 Total In Print", value: totalInPrint.toLocaleString(), sub: "qty ordered", color: "border-blue-700 bg-blue-950/30" },
+    { label: "🖨 Active Orders", value: activeSKUCount, sub: "SKUs in print", color: "border-indigo-700 bg-indigo-950/30" },
+    { label: "⚠ Delayed", value: delayedCount, sub: "printer ETA passed", color: "border-red-700 bg-red-950/30" },
+    { label: "📬 Arriving This Week", value: arrivingThisWeekCount, sub: "within 7 days", color: "border-emerald-700 bg-emerald-950/30" },
+  ];
+
+  return (
+    <div>
+      {/* Stat cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        {statCards.map(c => (
+          <div key={c.label} className={`rounded-xl border ${c.color} p-4`}>
+            <p className="text-xs text-gray-400">{c.label}</p>
+            <p className="text-3xl font-bold mt-1">{c.value}</p>
+            <p className="text-xs text-gray-500 mt-1">{c.sub}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Urgency table */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="p-4 border-b border-gray-800">
+          <h2 className="text-sm font-bold text-gray-200">All Active SKUs — Print Urgency</h2>
+          <p className="text-xs text-gray-500 mt-0.5">Sorted by urgency score (Effective Rate² ÷ Current Stock)</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-gray-700 text-gray-400">
+                {["#","SKU ID","Product Name","Stock","Daily Rate","Days Left","Urgency","In Print (qty)","Printer ETA","Warehouse ETA","Print Status","View"].map(h => (
+                  <th key={h} className="py-2 px-3 font-medium whitespace-nowrap">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {urgencyRows.map((item, idx) => {
+                const urg = urgencyLabel(item.days_out);
+                return (
+                  <tr key={item.sku} className={`border-b border-gray-800/50 hover:bg-gray-800/20${item.rowHighlight}`}>
+                    <td className="py-2.5 px-3 text-gray-600">{idx + 1}</td>
+                    <td className="py-2.5 px-3 font-mono text-gray-300 whitespace-nowrap">{item.sku}</td>
+                    <td className="py-2.5 px-3 text-gray-300 max-w-[180px] truncate" title={item.name}>{item.name}</td>
+                    <td className="py-2.5 px-3 font-bold text-white">{item.stock.toLocaleString()}</td>
+                    <td className="py-2.5 px-3 text-gray-300">{item.eff_rate}/d</td>
+                    <td className={`py-2.5 px-3 font-bold ${item.days_out <= 15 ? "text-red-400" : item.days_out <= 30 ? "text-amber-400" : "text-green-400"}`}>
+                      {item.days_out < 1 ? "<1" : item.days_out.toFixed(0)}d
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${urg.cls}`}>{urg.label}</span>
+                    </td>
+                    <td className="py-2.5 px-3 text-gray-300">{item.pData?.qty ? item.pData.qty.toLocaleString() : "—"}</td>
+                    <td className="py-2.5 px-3 text-gray-300 whitespace-nowrap">{item.printerETA ? fmtDate(item.printerETA) : "—"}</td>
+                    <td className="py-2.5 px-3 text-gray-300 whitespace-nowrap">{item.warehouseETA ? fmtDate(item.warehouseETA) : "—"}</td>
+                    <td className="py-2.5 px-3">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${item.badgeCls}`}>{item.badgeLabel}</span>
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <a href={PRINT_SHEET_URL} target="_blank" rel="noopener noreferrer"
+                        className="text-indigo-400 hover:text-indigo-300 whitespace-nowrap">View in Sheet ↗</a>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Log Drawer ───────────────────────────────────────────────────────────────
+function LogDrawer({ open, onClose, syncLog }) {
+  return (
+    <>
+      {/* Overlay */}
+      {open && <div className="fixed inset-0 z-40 bg-black/40" onClick={onClose} />}
+      {/* Drawer */}
+      <div className={`fixed top-0 right-0 h-full w-80 z-50 bg-gray-950 border-l border-gray-800 shadow-2xl transition-transform duration-300 flex flex-col ${
+        open ? "translate-x-0" : "translate-x-full"
+      }`}>
+        <div className="flex items-center justify-between px-4 py-4 border-b border-gray-800">
+          <h2 className="text-sm font-bold text-gray-200">📋 Sync Log</h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white text-lg">✕</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {syncLog.length === 0 && (
+            <p className="text-gray-600 text-xs text-center pt-8">No sync events yet. Click Sync to start.</p>
+          )}
+          {syncLog.map(entry => (
+            <div key={entry.id} className={`rounded-lg border p-3 text-xs ${
+              entry.type === "sync_error" ? "border-red-900 bg-red-950/30" : "border-gray-800 bg-gray-900"
+            }`}>
+              <div className="flex justify-between items-start mb-1">
+                <span className={`font-bold ${
+                  entry.type === "sync_error" ? "text-red-400" :
+                  entry.type === "manual_sync" ? "text-indigo-400" : "text-gray-400"
+                }`}>
+                  {entry.type === "sync_error" ? "⚠ Sync Error" :
+                   entry.type === "manual_sync" ? "Manual Sync" : "Auto Sync"}
+                </span>
+                <span className="text-gray-600 text-[10px]">{new Date(entry.timestamp).toLocaleString("en-IN", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" })}</span>
+              </div>
+              {entry.errorMessage ? (
+                <p className="text-red-400">{entry.errorMessage}</p>
+              ) : (
+                <p className="text-gray-400">{entry.skuCount} SKUs refreshed{entry.printChanges?.length > 0 ? ` · ${entry.printChanges.length} print change${entry.printChanges.length > 1 ? "s" : ""}` : ""}</p>
+              )}
+              {entry.printChanges?.length > 0 && (
+                <div className="mt-1.5 space-y-0.5">
+                  {entry.printChanges.map((c, i) => (
+                    <p key={i} className="text-[10px] font-mono text-gray-500">
+                      <span className="text-gray-400">{c.sku}</span> → {c.to}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -665,9 +967,19 @@ export default function App() {
   // New Data States
   const [deadData, setDeadData] = useState([]);
   const [mapDict, setMapDict] = useState({});
-  const [viewMode, setViewMode] = useState("projections"); // "projections" | "dead" | "mapped"
+  const [viewMode, setViewMode] = useState("projections"); // "projections" | "dead" | "mapped" | "print"
   const [lastMonthName, setLastMonthName] = useState("lastM");
   const [prevMonthName, setPrevMonthName] = useState("prevM");
+
+  // Print Timeline States
+  const [printData, setPrintData] = useState({});
+  const [printDataStale, setPrintDataStale] = useState(false);
+  const [printDataStaleSince, setPrintDataStaleSince] = useState(null);
+
+  // Log Drawer States (permanent, session-scoped)
+  const [syncLog, setSyncLog] = useState([]);
+  const [showLog, setShowLog] = useState(false);
+  const prevPrintDataRef = useRef({});
 
   // Settings & Configuration States
   const [skuStatusText, setSkuStatusText] = useState(null);
@@ -723,7 +1035,11 @@ export default function App() {
     } catch(e) {}
   };
 
-  const fetchApiData = async () => {
+  const addLogEntry = (entry) => {
+    setSyncLog(prev => [entry, ...prev]);
+  };
+
+  const fetchApiData = async (isManualSync = false) => {
     try {
       const res = await fetch(`${API_BASE}/api/data?t=${Date.now()}`, { cache: "no-store" });
       if (res.ok) {
@@ -733,8 +1049,56 @@ export default function App() {
           setInvText(d.invCSV); setInvName("API: Shiprocket Inventory");
           setTxnText(d.txnCSV); setTxnName("API: Shiprocket Transactions (Cache)");
         }
+        // Handle printData
+        const newPrintData = d.printData || {};
+        const staleSince = d.printDataStaleSince || null;
+        setPrintData(newPrintData);
+        setPrintDataStale(!!staleSince);
+        setPrintDataStaleSince(staleSince);
+
+        // Diff for log
+        const prevPrint = prevPrintDataRef.current || {};
+        const printChanges = [];
+        const allSKUs = new Set([...Object.keys(prevPrint), ...Object.keys(newPrintData)]);
+        allSKUs.forEach(sku => {
+          const wasIn = !!prevPrint[sku];
+          const isIn = !!newPrintData[sku];
+          const wasGRN = prevPrint[sku]?.grnDate;
+          const isGRN = newPrintData[sku]?.grnDate;
+          if (!wasIn && isIn) printChanges.push({ sku, to: "In Print (new order)" });
+          else if (wasIn && !isIn) printChanges.push({ sku, to: "Not In Print" });
+          else if (wasIn && isIn && !wasGRN && isGRN) printChanges.push({ sku, to: "Received ✓" });
+          else if (wasIn && isIn) {
+            const prevPrinterETA = prevPrint[sku]?.printerETA;
+            const newPrinterETA = newPrintData[sku]?.printerETA;
+            const today = new Date(); today.setHours(0,0,0,0);
+            const isDelayed = newPrinterETA && new Date(newPrinterETA) < today && !isGRN;
+            const wasDelayed = prevPrinterETA && new Date(prevPrinterETA) < today && !wasGRN;
+            if (isDelayed && !wasDelayed) printChanges.push({ sku, to: "Printer Delayed" });
+          }
+        });
+        prevPrintDataRef.current = newPrintData;
+
+        // Log entry
+        const skuCount = d.invCSV ? d.invCSV.split("\n").length - 1 : 0;
+        addLogEntry({
+          id: Date.now().toString(),
+          type: isManualSync ? "manual_sync" : "auto_sync",
+          timestamp: new Date().toISOString(),
+          skuCount,
+          printChanges,
+        });
       }
-    } catch(e) {}
+    } catch(e) {
+      addLogEntry({
+        id: Date.now().toString(),
+        type: "sync_error",
+        timestamp: new Date().toISOString(),
+        skuCount: 0,
+        printChanges: [],
+        errorMessage: "Failed to fetch data from backend: " + e.message,
+      });
+    }
   };
 
   const handleApiSync = async () => {
@@ -746,7 +1110,6 @@ export default function App() {
         setApiError(err.message || "Failed to start sync");
       } else {
         setSysStatus(prev => ({ ...prev, isSyncing: true }));
-        // Poll until sync finishes, then load data and auto-run
         const pollSync = setInterval(async () => {
           try {
             const st = await fetch(`${API_BASE}/api/status`);
@@ -755,8 +1118,7 @@ export default function App() {
               setSysStatus(sd);
               if (!sd.isSyncing) {
                 clearInterval(pollSync);
-                // Load fresh data
-                await fetchApiData();
+                await fetchApiData(true); // manual sync = true
                 autoRunRef.current = true;
               }
             }
@@ -920,15 +1282,30 @@ export default function App() {
           >
             {sysStatus.isSyncing ? "⏳ Syncing..." : "🔄 Sync"}
           </button>
+          <button onClick={() => setShowLog(true)} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold transition-all text-gray-300 border border-gray-700">
+            📋 Log{syncLog.length > 0 ? ` (${syncLog.length})` : ""}
+          </button>
           <button onClick={() => setShowSettings(true)} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold transition-all text-gray-300 border border-gray-700">
             ⚙️ Settings
           </button>
         </div>
       </div>
 
-      {/* Settings Panel */}
+      {/* Stale Print Data Banner */}
+      {printDataStale && (
+        <div className="mb-4 rounded-xl border border-amber-700 bg-amber-950/30 px-4 py-3 text-xs text-amber-300 flex items-center gap-2">
+          <span>⚠</span>
+          <span>Print data unavailable — last synced {printDataStaleSince ? new Date(printDataStaleSince).toLocaleString() : "unknown"}. Projection data is current.</span>
+          <span className="ml-auto text-amber-600">(stale)</span>
+        </div>
+      )}
+
+      {/* Log Drawer */}
+      <LogDrawer open={showLog} onClose={() => setShowLog(false)} syncLog={syncLog} />
+
+      {/* Tabs */}
       {data && (
-        <div className="flex gap-2 border-b border-gray-800 pb-4 mb-6">
+        <div className="flex gap-2 border-b border-gray-800 pb-4 mb-6 flex-wrap">
           <button onClick={() => setViewMode("projections")} className={`px-4 py-2 font-bold text-sm rounded-lg transition-all ${viewMode === "projections" ? "bg-indigo-900 text-indigo-200" : "text-gray-500 hover:bg-gray-900 hover:text-gray-300"}`}>
             📊 Projections
           </button>
@@ -937,6 +1314,9 @@ export default function App() {
           </button>
           <button onClick={() => setViewMode("mapped")} className={`px-4 py-2 font-bold text-sm rounded-lg transition-all ${viewMode === "mapped" ? "bg-gray-800 text-white" : "text-gray-500 hover:bg-gray-900 hover:text-gray-300"}`}>
             🔗 SKU Mappings
+          </button>
+          <button onClick={() => setViewMode("print")} className={`px-4 py-2 font-bold text-sm rounded-lg transition-all ${viewMode === "print" ? "bg-blue-900/60 text-blue-200" : "text-gray-500 hover:bg-gray-900 hover:text-gray-300"}`}>
+            🖨 Print Timeline
           </button>
         </div>
       )}
@@ -1089,7 +1469,7 @@ export default function App() {
 
           {/* SKU Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {filtered.map(item => <SKUCard key={item.sku} item={item} showPerSKU={showPerSKU} mappedFrom={reverseMap[item.sku]} lastMonthName={lastMonthName} prevMonthName={prevMonthName} />)}
+            {filtered.map(item => <SKUCard key={item.sku} item={item} showPerSKU={showPerSKU} mappedFrom={reverseMap[item.sku]} lastMonthName={lastMonthName} prevMonthName={prevMonthName} printData={printData} />)}
           </div>
 
           {filtered.length === 0 && (
@@ -1105,6 +1485,11 @@ export default function App() {
             Trigger horizon: {PROJ_DAYS + LEAD_TIME}d · Active SKUs: {counts.total}
           </div>
         </>
+      )}
+
+      {/* Print Timeline Tab */}
+      {viewMode === "print" && data && (
+        <PrintTimelineTab data={data} printData={printData} />
       )}
 
       {/* Dead Stock View */}
