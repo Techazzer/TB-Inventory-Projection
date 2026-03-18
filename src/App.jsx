@@ -1014,12 +1014,7 @@ export default function App() {
 
       // Fetch backend status and initial data
       fetchStatus();
-      fetchApiData();
-
-      // Auto-load cached data and run projection
-      try {
-        autoRunRef.current = true;
-      } catch(e) {}
+      await fetchApiData();  // await so data is ready before auto-run
     };
     loadConfig();
 
@@ -1048,6 +1043,8 @@ export default function App() {
           setApiData({ invCSV: d.invCSV, txnCSV: d.txnCSV });
           setInvText(d.invCSV); setInvName("API: Shiprocket Inventory");
           setTxnText(d.txnCSV); setTxnName("API: Shiprocket Transactions (Cache)");
+          // Signal auto-run AFTER data is set in state
+          autoRunRef.current = true;
         }
         // Handle printData
         const newPrintData = d.printData || {};
