@@ -1115,8 +1115,19 @@ export default function App() {
               setSysStatus(sd);
               if (!sd.isSyncing) {
                 clearInterval(pollSync);
-                await fetchApiData(true); // manual sync = true
-                autoRunRef.current = true;
+                if (sd.lastSyncError) {
+                  addLogEntry({
+                    id: Date.now().toString(),
+                    type: "sync_error",
+                    timestamp: new Date().toISOString(),
+                    skuCount: 0,
+                    printChanges: [],
+                    errorMessage: sd.lastSyncError,
+                  });
+                } else {
+                  await fetchApiData(true); // manual sync = true
+                  autoRunRef.current = true;
+                }
               }
             }
           } catch(e) {}

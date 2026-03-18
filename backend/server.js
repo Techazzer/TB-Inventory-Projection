@@ -264,16 +264,25 @@ async function performSync() {
 
     const cfg = getConfig();
     cfg.lastSynced = new Date().toISOString();
+    cfg.lastSyncError = null; // Clear error on success
     if (printSyncOk) cfg.lastPrintSynced = new Date().toISOString();
     saveConfig(cfg);
 
     console.log(`Sync complete: ${normalizedTxns.length - 1} txn rows · printOk=${printSyncOk}`);
   } catch (err) {
-    console.error("Sync failed:", err.message);
+    const errorMsg = err.stack ? err.stack : err.message;
+    console.error("Sync failed deeply:", errorMsg);
+    if (err.response && err.response.data) {
+      console.error("Axios response data:", err.response.data);
+    }
+    const cfg = getConfig();
+    cfg.lastSyncError = err.message || "Unknown error occurred during sync";
+    saveConfig(cfg);
   } finally {
     isSyncing = false;
   }
 }
+
 
 // ── API Routes ────────────────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
@@ -290,8 +299,10 @@ app.get("/api/status", (req, res) => {
     emailCc: cfg.emailCc,
     printDataStale: !!cache.printDataStaleSince,
     printDataStaleSince: cache.printDataStaleSince || null,
+    lastSyncError: cfg.lastSyncError || null,
   });
 });
+
 
 app.post("/api/upload_csv", express.json({ limit: "50mb" }), (req, res) => {
   const { type, text } = req.body;
@@ -315,6 +326,19 @@ app.post("/api/settings", (req, res) => {
   saveConfig(cfg);
   setupCronJobs();
   res.json({ success: true, message: "Settings saved" });
+});
+
+app.get("/api/debug", (req, res) => {
+  const cfg = getConfig();
+  res.json({
+    hasInvUrl: !!process.env.GOOGLE_SHEET_INVENTORY_CSV_URL,
+    hasTxnUrl: !!process.env.GOOGLE_SHEET_TRANSACTIONS_CSV_URL,
+    hasPrintId: !!process.env.GOOGLE_SHEET_PRINT_ID,
+    hasServiceEmail: !!process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    hasServiceKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
+    keySnippet: process.env.GOOGLE_SERVICE_ACCOUNT_KEY ? process.env.GOOGLE_SERVICE_ACCOUNT_KEY.substring(0, 30) : null,
+    lastSyncError: cfg.lastSyncError || "No recent error",
+  });
 });
 
 app.post("/api/sync", async (req, res) => {
