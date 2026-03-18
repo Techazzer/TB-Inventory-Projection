@@ -759,11 +759,11 @@ function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName, p
 }
 
 // ─── Print Timeline Tab ───────────────────────────────────────────────────────
-const PRINT_SHEET_ID = import.meta.env.VITE_PRINT_SHEET_ID || "1jukH-tiSaUFicNcNCrpSOChL9OfPLkze0FYMTq7J4QE";
-const PRINT_SHEET_GID = import.meta.env.VITE_PRINT_SHEET_GID || "";
-const PRINT_SHEET_URL = `https://docs.google.com/spreadsheets/d/${PRINT_SHEET_ID}/edit${PRINT_SHEET_GID ? `#gid=${PRINT_SHEET_GID}` : ""}`;
+// Print sheet URL is built at runtime from backend config (no VITE_ vars needed)
 
-function PrintTimelineTab({ data, printData }) {
+function PrintTimelineTab({ data, printData, sheetId, sheetGid }) {
+  const PRINT_SHEET_URL = `https://docs.google.com/spreadsheets/d/${sheetId || "1jukH-tiSaUFicNcNCrpSOChL9OfPLkze0FYMTq7J4QE"}/edit${sheetGid ? `#gid=${sheetGid}` : ""}`;
+
   const today = new Date(); today.setHours(0,0,0,0);
   const next7 = new Date(today); next7.setDate(today.getDate() + 7);
 
@@ -1491,7 +1491,7 @@ export default function App() {
 
       {/* Print Timeline Tab */}
       {viewMode === "print" && data && (
-        <PrintTimelineTab data={data} printData={printData} />
+        <PrintTimelineTab data={data} printData={printData} sheetId={sysStatus.printSheetId} sheetGid={sysStatus.printSheetGid} />
       )}
 
       {/* Dead Stock View */}

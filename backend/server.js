@@ -290,6 +290,8 @@ app.get("/api/status", (req, res) => {
     emailCc: cfg.emailCc,
     printDataStale: !!cache.printDataStaleSince,
     printDataStaleSince: cache.printDataStaleSince || null,
+    printSheetId: process.env.GOOGLE_SHEET_PRINT_ID || "",
+    printSheetGid: process.env.GOOGLE_SHEET_PRINT_GID || "",
   });
 });
 
