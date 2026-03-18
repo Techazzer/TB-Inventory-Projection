@@ -12,8 +12,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const CONFIG_PATH = path.join(__dirname, "../backend_config.json");
-const CACHE_PATH = path.join(__dirname, "../backend_cache.json");
+const os = require("os");
+const CONFIG_PATH = path.join(os.tmpdir(), "backend_config.json");
+const CACHE_PATH = path.join(os.tmpdir(), "backend_cache.json");
 
 const defaultCfg = {
   adminPassword: "Testbook_new",
@@ -36,7 +37,9 @@ function getConfig() {
 }
 
 function saveConfig(cfg) {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  } catch(e) { console.error("Could not write config:", e.message); }
 }
 
 function getCache() {
@@ -260,7 +263,11 @@ async function performSync() {
       printData,
       printDataStaleSince: printSyncOk ? null : printDataStaleSince,
     };
-    fs.writeFileSync(CACHE_PATH, JSON.stringify(newCache));
+    try {
+      fs.writeFileSync(CACHE_PATH, JSON.stringify(newCache));
+    } catch(err) {
+      console.error("Could not write cache file:", err.message);
+    }
 
     const cfg = getConfig();
     cfg.lastSynced = new Date().toISOString();
