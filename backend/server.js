@@ -66,10 +66,13 @@ async function fetchPrintMastersheet() {
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
+  const printTab = process.env.GOOGLE_SHEET_PRINT_TAB || "";
+  const printRange = printTab ? `${printTab}!A:Q` : "A:Q";
+
   const sheets = google.sheets({ version: "v4", auth });
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: "A:Q", // Cols A-Q as per spec
+    range: printRange,
   });
 
   const rows = response.data.values || [];
