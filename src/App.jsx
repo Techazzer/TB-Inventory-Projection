@@ -893,6 +893,50 @@ function PrintTimelineTab({ data, printData }) {
   );
 }
 
+function LogEntryCard({ entry }) {
+  const [expanded, setExpanded] = useState(false);
+  
+  return (
+    <div className={`rounded-lg border p-3 text-xs ${
+      entry.type === "sync_error" ? "border-red-900 bg-red-950/30" : "border-gray-800 bg-gray-900"
+    }`}>
+      <div className="flex justify-between items-start mb-1">
+        <span className={`font-bold ${
+          entry.type === "sync_error" ? "text-red-400" :
+          entry.type === "manual_sync" ? "text-indigo-400" : "text-gray-400"
+        }`}>
+          {entry.type === "sync_error" ? "⚠ Sync Error" :
+           entry.type === "manual_sync" ? "Manual Sync" : "Auto Sync"}
+        </span>
+        <span className="text-gray-600 text-[10px]">{new Date(entry.timestamp).toLocaleString("en-IN", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" })}</span>
+      </div>
+      
+      {entry.errorMessage ? (
+        <p className="text-red-400">{entry.errorMessage}</p>
+      ) : (
+        <p className="text-gray-400">
+          {entry.skuCount} SKUs refreshed
+          {entry.printChanges?.length > 0 && (
+            <span className="cursor-pointer text-blue-400 hover:text-blue-300 ml-1" onClick={() => setExpanded(!expanded)}>
+              · {entry.printChanges.length} print change{entry.printChanges.length > 1 ? "s" : ""} {expanded ? "▲" : "▼"}
+            </span>
+          )}
+        </p>
+      )}
+      
+      {expanded && entry.printChanges?.length > 0 && (
+        <div className="mt-2 pt-2 border-t border-gray-800 space-y-0.5">
+          {entry.printChanges.map((c, i) => (
+            <p key={i} className="text-[10px] font-mono text-gray-500">
+              <span className="text-gray-300">{c.sku}</span> → <span className="text-gray-400">{c.to}</span>
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Log Drawer ───────────────────────────────────────────────────────────────
 function LogDrawer({ open, onClose, syncLog }) {
   return (
@@ -912,40 +956,14 @@ function LogDrawer({ open, onClose, syncLog }) {
             <p className="text-gray-600 text-xs text-center pt-8">No sync events yet. Click Sync to start.</p>
           )}
           {syncLog.map(entry => (
-            <div key={entry.id} className={`rounded-lg border p-3 text-xs ${
-              entry.type === "sync_error" ? "border-red-900 bg-red-950/30" : "border-gray-800 bg-gray-900"
-            }`}>
-              <div className="flex justify-between items-start mb-1">
-                <span className={`font-bold ${
-                  entry.type === "sync_error" ? "text-red-400" :
-                  entry.type === "manual_sync" ? "text-indigo-400" : "text-gray-400"
-                }`}>
-                  {entry.type === "sync_error" ? "⚠ Sync Error" :
-                   entry.type === "manual_sync" ? "Manual Sync" : "Auto Sync"}
-                </span>
-                <span className="text-gray-600 text-[10px]">{new Date(entry.timestamp).toLocaleString("en-IN", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" })}</span>
-              </div>
-              {entry.errorMessage ? (
-                <p className="text-red-400">{entry.errorMessage}</p>
-              ) : (
-                <p className="text-gray-400">{entry.skuCount} SKUs refreshed{entry.printChanges?.length > 0 ? ` · ${entry.printChanges.length} print change${entry.printChanges.length > 1 ? "s" : ""}` : ""}</p>
-              )}
-              {entry.printChanges?.length > 0 && (
-                <div className="mt-1.5 space-y-0.5">
-                  {entry.printChanges.map((c, i) => (
-                    <p key={i} className="text-[10px] font-mono text-gray-500">
-                      <span className="text-gray-400">{c.sku}</span> → {c.to}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </div>
+            <LogEntryCard key={entry.id} entry={entry} />
           ))}
         </div>
       </div>
     </>
   );
 }
+
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
