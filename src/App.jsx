@@ -759,13 +759,9 @@ function SKUCard({ item, showPerSKU, mappedFrom, lastMonthName, prevMonthName, p
 }
 
 // ─── Print Timeline Tab ───────────────────────────────────────────────────────
-// Print sheet URL — configured via Vercel env vars
-const PRINT_SHEET_ID = import.meta.env.VITE_PRINT_SHEET_ID || "1jukH-tiSaUFicNcNCrpSOChL9OfPLkze0FYMTq7J4QE";
-const PRINT_SHEET_GID = import.meta.env.VITE_PRINT_SHEET_GID || "";
-const PRINT_SHEET_URL = `https://docs.google.com/spreadsheets/d/${PRINT_SHEET_ID}/edit${PRINT_SHEET_GID ? `#gid=${PRINT_SHEET_GID}` : ""}`;
+const PRINT_SHEET_URL = `https://docs.google.com/spreadsheets/d/${import.meta.env.VITE_PRINT_SHEET_ID || "1jukH-tiSaUFicNcNCrpSOChL9OfPLkze0FYMTq7J4QE"}`;
 
 function PrintTimelineTab({ data, printData }) {
-
   const today = new Date(); today.setHours(0,0,0,0);
   const next7 = new Date(today); next7.setDate(today.getDate() + 7);
 
@@ -932,10 +928,7 @@ function LogDrawer({ open, onClose, syncLog }) {
               {entry.errorMessage ? (
                 <p className="text-red-400">{entry.errorMessage}</p>
               ) : (
-                <p className="text-gray-400 font-mono">
-                  inv: {entry.skuCount ?? 0} rows · txn: {entry.txnRows ?? 0} rows · print: {entry.printSKUs ?? 0} SKUs
-                  {entry.printChanges?.length > 0 && <span className="text-indigo-400 ml-1">· {entry.printChanges.length} change{entry.printChanges.length > 1 ? "s" : ""}</span>}
-                </p>
+                <p className="text-gray-400">{entry.skuCount} SKUs refreshed{entry.printChanges?.length > 0 ? ` · ${entry.printChanges.length} print change${entry.printChanges.length > 1 ? "s" : ""}` : ""}</p>
               )}
               {entry.printChanges?.length > 0 && (
                 <div className="mt-1.5 space-y-0.5">
@@ -1086,27 +1079,14 @@ export default function App() {
         });
         prevPrintDataRef.current = newPrintData;
 
-        // Log entry — use _meta from backend for accurate counts
-        const meta = d._meta || {};
-        const invLines = meta.invLines ?? (d.invCSV ? d.invCSV.split("\n").length - 1 : 0);
+        // Log entry
+        const skuCount = d.invCSV ? d.invCSV.split("\n").length - 1 : 0;
         addLogEntry({
           id: Date.now().toString(),
           type: isManualSync ? "manual_sync" : "auto_sync",
           timestamp: new Date().toISOString(),
-          skuCount: invLines,
-          txnRows: meta.txnLines ?? 0,
-          printSKUs: meta.printSKUs ?? Object.keys(d.printData || {}).length,
+          skuCount,
           printChanges,
-        });
-      } else {
-        // Backend returned a non-200 response
-        addLogEntry({
-          id: Date.now().toString(),
-          type: "sync_error",
-          timestamp: new Date().toISOString(),
-          skuCount: 0,
-          printChanges: [],
-          errorMessage: `Backend returned HTTP ${res.status}. Check /api/debug for env var diagnostics.`,
         });
       }
     } catch(e) {
@@ -1116,7 +1096,7 @@ export default function App() {
         timestamp: new Date().toISOString(),
         skuCount: 0,
         printChanges: [],
-        errorMessage: "Could not reach backend: " + e.message,
+        errorMessage: "Failed to fetch data from backend: " + e.message,
       });
     }
   };
